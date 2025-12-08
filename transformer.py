@@ -735,3 +735,109 @@ class TransformerModel(language_model_basics.LanguageModel):
 
     def num_non_embedding_parameters(self):
         return self.num_parameters() - self.num_embedding_parameters()
+
+    def get_logits(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Get logits for input tokens.
+
+        Args:
+            input_ids: Token IDs of shape [batch_size, seq_len]
+
+        Returns:
+            Logits of shape [batch_size, seq_len, vocab_size]
+        """
+        return self.forward(input_ids)
+
+    def compute_token_logprobs(
+        self, input_ids: torch.Tensor, target_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute log probabilities for target tokens.
+
+        Note: Currently designed for batch_size=1 (no padding/masking support yet).
+
+        Args:
+            input_ids: Context token IDs of shape [batch_size, context_len]
+                where context_len >= 1
+            target_ids: Target token IDs of shape [batch_size, target_len]
+
+        Returns:
+            Log probabilities for each target token, shape [batch_size, target_len]
+        """
+        context_len = input_ids.shape[1]
+        if context_len < 1:
+            raise ValueError(
+                f"input_ids must have at least 1 context token, got {context_len}. "
+                "Consider prepending a BOS token if context is empty."
+            )
+
+        # Concatenate context and targets
+        full_input = torch.cat([input_ids, target_ids], dim=1)
+
+        # Get embeddings for all positions (needed for causal attention)
+        # but only project to vocab space for the positions we need.
+        # This saves memory: [batch, seq_len, embed_dim] is much smaller than
+        # [batch, seq_len, vocab_size].
+        embeddings = self._forward_opt(full_input)  # [batch, seq_len, embed_dim]
+
+        # Extract embeddings for positions where we predict target tokens
+        # We want positions [context_len-1 : context_len+target_len-1]
+        target_len = target_ids.shape[1]
+        prediction_embeddings = embeddings[:, context_len - 1 : context_len + target_len - 1, :]
+
+        # Project only the needed positions to vocab space
+        prediction_logits = self.output_projection(prediction_embeddings)
+
+        # Compute log probabilities
+        log_probs = torch.nn.functional.log_softmax(prediction_logits, dim=-1)
+
+        # Gather log probs for actual target tokens
+        batch_size = target_ids.shape[0]
+        batch_indices = torch.arange(batch_size, device=target_ids.device).unsqueeze(1)
+        position_indices = torch.arange(target_len, device=target_ids.device).unsqueeze(0)
+
+        token_logprobs = log_probs[batch_indices, position_indices, target_ids]
+
+        return token_logprobs
+
+    def is_greedy_generation(
+        self, input_ids: torch.Tensor, continuation_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """Check if continuation tokens are greedy (argmax) predictions.
+
+        Note: Currently designed for batch_size=1 (no padding/masking support yet).
+
+        Args:
+            input_ids: Context token IDs of shape [batch_size, context_len]
+                where context_len >= 1
+            continuation_ids: Continuation token IDs of shape [batch_size, cont_len]
+
+        Returns:
+            Boolean tensor of shape [batch_size] indicating if each continuation is greedy
+        """
+        context_len = input_ids.shape[1]
+        if context_len < 1:
+            raise ValueError(
+                f"input_ids must have at least 1 context token, got {context_len}. "
+                "Consider prepending a BOS token if context is empty."
+            )
+
+        # Concatenate context and continuation
+        full_input = torch.cat([input_ids, continuation_ids], dim=1)
+
+        # Get embeddings for all positions (needed for causal attention)
+        # but only project to vocab space for the positions we need.
+        embeddings = self._forward_opt(full_input)  # [batch, seq_len, embed_dim]
+
+        # Extract embeddings for positions where we predict continuation tokens
+        cont_len = continuation_ids.shape[1]
+        prediction_embeddings = embeddings[:, context_len - 1 : context_len + cont_len - 1, :]
+
+        # Project only the needed positions to vocab space
+        prediction_logits = self.output_projection(prediction_embeddings)
+
+        # Get greedy predictions
+        greedy_tokens = prediction_logits.argmax(dim=-1)
+
+        # Check if all continuation tokens match greedy predictions
+        is_greedy = (greedy_tokens == continuation_ids).all(dim=1)
+
+        return is_greedy
